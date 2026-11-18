@@ -12,7 +12,7 @@ Major changes:
 
 Minor changes:
 
-- Azure: Emit KVP diagnostics and report provisioning health through libazureinit-kvp
+- Azure: Emit KVP diagnostics for metadata requests and their results, and report provisioning health through libazureinit-kvp, including watched systemd boot services that are failed at check-in
 - Reuse the existing HTTP client when building PATCH, PUT, and POST requests
 - Azure: Read the admin password from OVF `UserPassword` when rendering the platform-user Ignition fragment
 - Azure: Support configurable platform-user groups via `--user-group`
@@ -20,6 +20,8 @@ Minor changes:
 - ProxmoxVE: Accept user-data without a `hostname` key
 
 Packaging changes:
+
+- Require zbus ≥ 5.11 for the bounded systemd query at Azure check-in
 
 ## Afterburn 5.11.0
 

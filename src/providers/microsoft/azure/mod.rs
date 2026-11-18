@@ -14,6 +14,7 @@
 
 //! Azure provider, metadata and wireserver fetcher.
 
+mod boot_services;
 pub(crate) mod config;
 mod reporting;
 
@@ -21,10 +22,9 @@ use super::goalstate;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::Instant;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use libazureinit_kvp::Outcome;
 use openssh_keys::PublicKey;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -45,6 +45,7 @@ static HDR_VERSION: &str = "x-ms-version";
 
 const MS_AGENT_NAME: &str = "com.coreos.afterburn";
 const MS_VERSION: &str = "2012-11-30";
+const IMDS_ENDPOINT: &str = "http://169.254.169.254";
 
 /// This is a known working wireserver endpoint within Azure.
 /// See: https://blogs.msdn.microsoft.com/mast/2015/05/18/what-is-the-ip-address-168-63-129-16/
@@ -67,7 +68,7 @@ struct Supported {
 pub struct Azure {
     client: retry::Client,
     endpoint: IpAddr,
-    reporting: Reporting,
+    reporting: Arc<Reporting>,
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +83,22 @@ struct ImdsSshKey {
     key_data: String,
     #[serde(default)]
     path: String,
+}
+
+// Show ordinary hostnames and VM size labels, never an arbitrary IMDS response body.
+fn diagnostic_label(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() {
+        "<empty>"
+    } else if value.len() <= 253
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        value
+    } else {
+        "<omitted: unexpected label>"
+    }
 }
 
 fn imds_key_path_context(path: &str) -> String {
@@ -137,14 +154,11 @@ impl Azure {
     }
 
     fn platform_reporting() -> (IpAddr, Reporting) {
-        let started = Instant::now();
         let endpoint = Self::get_fabric_address();
         let reporting = Reporting::for_endpoint(format!("http://{endpoint}/provisioning/health"));
-        reporting.event(
+        reporting.note(
             "fabric:discovery",
-            format!("selected WireServer address {endpoint}"),
-            Some(Outcome::Ok),
-            Some(started.elapsed()),
+            format!("Selected Azure WireServer at {endpoint}"),
         );
         (endpoint, reporting)
     }
@@ -154,7 +168,9 @@ impl Azure {
         endpoint: IpAddr,
         reporting: Reporting,
     ) -> Result<Azure> {
-        reporting.clone().operation("provider:init", || {
+        let reporting = Arc::new(reporting);
+        reporting.operation("provider:init", || {
+            reporting.note("provider:init", "Initializing Azure metadata client");
             let mut client = match client {
                 Some(c) => c,
                 None => retry::Client::try_new()?,
@@ -174,12 +190,11 @@ impl Azure {
             let azure = Azure {
                 client,
                 endpoint,
-                reporting,
+                reporting: Arc::clone(&reporting),
             };
 
             azure
-                .reporting
-                .observe("fabric:versions", || azure.is_fabric_compatible(MS_VERSION))
+                .is_fabric_compatible(MS_VERSION)
                 .inspect_err(|_e| {
                     if !Uid::current().is_root() {
                         // See https://github.com/coreos/bugs/issues/2468.
@@ -194,16 +209,25 @@ impl Azure {
 
     /// Retrieve `goalstate` content from the WireServer.
     fn fetch_goalstate(&self) -> Result<goalstate::GoalState> {
-        self.reporting.observe("fabric:goalstate", || {
-            self.client
-                .get(
-                    retry::Xml,
-                    format!("{}/machine/?comp=goalstate", self.fabric_base_url()),
-                )
-                .send()
-                .context("failed to get goal state")?
-                .ok_or_else(|| anyhow!("failed to get goal state: not found response"))
-        })
+        let url = format!("{}/machine/?comp=goalstate", self.fabric_base_url());
+        self.reporting.note(
+            "fabric:goalstate",
+            format!("Fetching goal state: GET {url}"),
+        );
+        let state: goalstate::GoalState = self
+            .client
+            .get(retry::Xml, url)
+            .send()
+            .context("failed to get goal state")?
+            .ok_or_else(|| anyhow!("failed to get goal state: not found response"))?;
+        self.reporting.note(
+            "fabric:goalstate",
+            format!(
+                "Parsed goal state: {} role instance(s)",
+                state.container.role_instance_list.role_instances.len()
+            ),
+        );
+        Ok(state)
     }
 
     #[cfg(not(test))]
@@ -239,17 +263,24 @@ impl Azure {
     }
 
     fn is_fabric_compatible(&self, version: &str) -> Result<()> {
+        let url = format!("{}/?comp=versions", self.fabric_base_url());
+        self.reporting.note(
+            "fabric:versions",
+            format!("Checking WireServer API compatibility: GET {url}"),
+        );
         let versions: Versions = self
             .client
-            .get(
-                retry::Xml,
-                format!("{}/?comp=versions", self.fabric_base_url()),
-            )
+            .get(retry::Xml, url)
             .send()
             .context("failed to get versions")?
             .ok_or_else(|| anyhow!("failed to get versions: not found"))?;
 
-        if versions.supported.versions.iter().any(|v| v == version) {
+        let supported = versions.supported.versions.iter().any(|v| v == version);
+        self.reporting.note(
+            "fabric:versions",
+            format!("WireServer supports API version {version}: {supported}"),
+        );
+        if supported {
             Ok(())
         } else {
             Err(anyhow!(
@@ -260,8 +291,19 @@ impl Azure {
         }
     }
 
-    fn metadata_endpoint() -> String {
-        "http://169.254.169.254".into()
+    fn get_imds_text(&self, event: &str, field: &str, path: &str) -> Result<Option<String>> {
+        let url = format!("{IMDS_ENDPOINT}/{path}");
+        self.reporting
+            .note(event, format!("Fetching {field} from IMDS: GET {url}"));
+        self.client
+            .clone()
+            .header(
+                HeaderName::from_static("metadata"),
+                HeaderValue::from_static("true"),
+            )
+            .get(retry::Raw, url)
+            .send()
+            .inspect_err(|_| self.reporting.note(event, "IMDS GET failed"))
     }
 
     fn get_attributes(&self) -> Result<Attributes> {
@@ -277,14 +319,24 @@ impl Azure {
             .configuration
             .shared_config;
 
-        let shared_config: goalstate::SharedConfig =
-            self.reporting.observe("fabric:shared-config", || {
-                self.client
-                    .get(retry::Xml, endpoint.to_string())
-                    .send()
-                    .context("failed to get shared configuration")?
-                    .ok_or_else(|| anyhow!("failed to get shared configuration: not found"))
-            })?;
+        // The goal-state-provided URL can contain instance identifiers and query parameters.
+        self.reporting.note(
+            "fabric:shared-config",
+            "Fetching shared configuration from the URL in goal state",
+        );
+        let shared_config: goalstate::SharedConfig = self
+            .client
+            .get(retry::Xml, endpoint.to_string())
+            .send()
+            .context("failed to get shared configuration")?
+            .ok_or_else(|| anyhow!("failed to get shared configuration: not found"))?;
+        self.reporting.note(
+            "fabric:shared-config",
+            format!(
+                "Parsed shared configuration: {} instance(s)",
+                shared_config.instances.instances.len()
+            ),
+        );
 
         let mut attributes = Attributes::default();
 
@@ -303,96 +355,84 @@ impl Azure {
             }
         }
 
+        self.reporting.note(
+            "attributes",
+            format!(
+                "Matched network attributes: dynamic IPv4 present={}, virtual IPv4 present={}",
+                attributes.dynamic_ipv4.is_some(),
+                attributes.virtual_ipv4.is_some()
+            ),
+        );
         Ok(attributes)
     }
 
     fn fetch_hostname(&self) -> Result<Option<String>> {
         const NAME_URL: &str = "metadata/instance/compute/name?api-version=2017-08-01&format=text";
-        let url = format!("{}/{}", Self::metadata_endpoint(), NAME_URL);
-
         let name = self
-            .client
-            .clone()
-            .header(
-                HeaderName::from_static("metadata"),
-                HeaderValue::from_static("true"),
-            )
-            .get(retry::Raw, url)
-            .send()
+            .get_imds_text("imds:hostname", "hostname", NAME_URL)
             .context("failed to get hostname")?;
+        self.reporting.note(
+            "imds:hostname",
+            format!(
+                "IMDS returned hostname: {}",
+                name.as_deref().map_or("<not provided>", diagnostic_label)
+            ),
+        );
         Ok(name)
     }
 
     fn fetch_vmsize(&self) -> Result<String> {
         const VMSIZE_URL: &str =
             "metadata/instance/compute/vmSize?api-version=2017-08-01&format=text";
-        let url = format!("{}/{}", Self::metadata_endpoint(), VMSIZE_URL);
-
         let vmsize = self
-            .client
-            .clone()
-            .header(
-                HeaderName::from_static("metadata"),
-                HeaderValue::from_static("true"),
-            )
-            .get(retry::Raw, url)
-            .send()?
+            .get_imds_text("imds:vm-size", "VM size", VMSIZE_URL)?
             .context("failed to get vmsize")?;
+        self.reporting.note(
+            "imds:vm-size",
+            format!("IMDS returned VM size: {}", diagnostic_label(&vmsize)),
+        );
         Ok(vmsize)
     }
 
     fn fetch_admin_username(&self) -> Result<Option<String>> {
         const URL: &str =
             "metadata/instance/compute/osProfile/adminUsername?api-version=2021-02-01&format=text";
-        let url = format!("{}/{}", Self::metadata_endpoint(), URL);
-
         let username = self
-            .client
-            .clone()
-            .header(
-                HeaderName::from_static("metadata"),
-                HeaderValue::from_static("true"),
-            )
-            .get(retry::Raw, url)
-            .send::<String>()
-            .context("failed to query IMDS for adminUsername")?;
-
-        match username.map(|u| u.trim().to_owned()) {
-            Some(u) if !u.is_empty() => Ok(Some(u)),
-            _ => Ok(None),
-        }
+            .get_imds_text("imds:admin-username", "admin username", URL)
+            .context("failed to query IMDS for adminUsername")?
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty());
+        self.reporting.note(
+            "imds:admin-username",
+            if username.is_some() {
+                "IMDS provided an admin username"
+            } else {
+                "IMDS did not provide an admin username"
+            },
+        );
+        Ok(username)
     }
 
     fn fetch_ssh_keys(&self) -> Result<Vec<PublicKey>> {
         const URL: &str = "metadata/instance/compute/publicKeys?api-version=2021-02-01";
-        let url = format!("{}/{}", Self::metadata_endpoint(), URL);
-
         let body = self
-            .client
-            .clone()
-            .header(
-                HeaderName::from_static("metadata"),
-                HeaderValue::from_static("true"),
-            )
-            .get(retry::Raw, url)
-            .send::<String>()
+            .get_imds_text("imds:public-keys", "SSH public keys", URL)
             .context("failed to query IMDS for publicKeys")?
             .ok_or_else(|| anyhow::anyhow!("IMDS did not return a publicKeys payload"))?;
 
-        self.reporting.event(
+        self.reporting.note(
             "imds:public-keys",
-            "received SSH-key metadata; validating keys",
-            None,
-            None,
+            "Received SSH-key metadata; validating keys",
         );
-        let keys = self
-            .reporting
-            .observe("ssh-keys:parse", || parse_imds_public_keys(&body))?;
-        self.reporting.event(
-            "ssh-keys:count",
-            format!("validated {} SSH keys", keys.len()),
-            Some(Outcome::Ok),
-            None,
+        let keys = parse_imds_public_keys(&body).inspect_err(|_| {
+            self.reporting.note(
+                "imds:public-keys",
+                "SSH-key metadata did not pass validation",
+            );
+        })?;
+        self.reporting.note(
+            "imds:public-keys",
+            format!("Validated {} SSH public key(s)", keys.len()),
         );
         Ok(keys)
     }
@@ -402,9 +442,7 @@ impl MetadataProvider for Azure {
     fn attributes(&self) -> Result<HashMap<String, String>> {
         self.reporting.operation("attributes", || {
             let attributes = self.get_attributes()?;
-            let vmsize = self
-                .reporting
-                .observe("imds:vm-size", || self.fetch_vmsize())?;
+            let vmsize = self.fetch_vmsize()?;
             let mut out = HashMap::with_capacity(3);
 
             if let Some(virtual_ipv4) = attributes.virtual_ipv4 {
@@ -433,9 +471,20 @@ impl MetadataProvider for Azure {
 
     fn admin_password_hash(&self) -> Result<Option<String>> {
         self.reporting.operation("admin:password-hash", || {
-            config::read_ovf_admin_password()?
-                .map(|password| config::hash_admin_password(&password))
-                .transpose()
+            self.reporting.note(
+                "ovf:admin-password",
+                "Checking OVF provisioning data for an admin password",
+            );
+            let Some(password) = config::read_ovf_admin_password()? else {
+                self.reporting
+                    .note("ovf:admin-password", "No OVF admin password available");
+                return Ok(None);
+            };
+            self.reporting.note(
+                "ovf:admin-password",
+                "OVF admin password present; preparing its hash",
+            );
+            config::hash_admin_password(&password).map(Some)
         })
     }
 
@@ -452,6 +501,25 @@ impl MetadataProvider for Azure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_diagnostic_label() {
+        let longest = "a".repeat(253);
+        assert_eq!(diagnostic_label(&longest), longest);
+        assert_eq!(
+            diagnostic_label(&(longest + "a")),
+            "<omitted: unexpected label>"
+        );
+        assert_eq!(
+            diagnostic_label(" demo-node.example \n"),
+            "demo-node.example"
+        );
+        assert_eq!(diagnostic_label(" \t "), "<empty>");
+        assert_eq!(
+            diagnostic_label("first\0second"),
+            "<omitted: unexpected label>"
+        );
+    }
 
     #[test]
     fn test_parse_imds_public_keys_rejects_malformed_key() {

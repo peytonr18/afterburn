@@ -20,14 +20,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use libazureinit_kvp::{
-    Diagnostic, DiagnosticReader, Entry, KvpPool, KvpPoolStore, Outcome, PoolMode,
-    ProvisioningReport, ReportResult, WireserverConfig, PROVISIONING_REPORT_KEY,
+    Diagnostic, DiagnosticPayload, DiagnosticReader, Entry, KvpPool, KvpPoolStore, Outcome,
+    PoolMode, ProvisioningReport, ReportResult, WireserverConfig, PROVISIONING_REPORT_KEY,
 };
 use mockito::{Mock, Server};
 use serde::Serialize;
 use serde_json::{json, Value};
 use xml::reader::{EventReader, XmlEvent};
 
+use super::boot_services::{self, UnitState};
 use super::reporting::Reporting;
 use super::Azure;
 use crate::providers::MetadataProvider;
@@ -36,7 +37,6 @@ use crate::retry;
 const VM_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const KEYS_PATH: &str = "/metadata/instance/compute/publicKeys?api-version=2021-02-01";
 const HOSTNAME_PATH: &str = "/metadata/instance/compute/name?api-version=2017-08-01&format=text";
-const GOOD_KEYS: &str = r#"[{"keyData":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE5dnA1jzwJZ2ndPmoZAvB1MDLU+UJpw0o9EzGm6tF5Y demo"}]"#;
 const BAD_KEYS: &str = r#"[{"keyData":"not-an-ssh-key","path":"/home/core/.ssh/authorized_keys"}]"#;
 const GOALSTATE: &str = r#"<GoalState><Incarnation>42</Incarnation><Container>
 <ContainerId>demo-container</ContainerId><RoleInstanceList>
@@ -56,8 +56,26 @@ fn config(server: &Server) -> WireserverConfig {
     }
 }
 
+fn unit(name: &str, state: &str) -> UnitState {
+    UnitState {
+        name: name.into(),
+        active_state: state.into(),
+    }
+}
+
+fn fixture_reporting(config: WireserverConfig, pool: &Path, id: io::Result<String>) -> Reporting {
+    Reporting::new(config, pool, id, || {
+        Ok(vec![
+            unit("ignition-fetch.service", "active"),
+            unit("ignition-fetch-offline.service", "inactive"),
+            unit("some-other.service", "failed"),
+            unit("afterburn-checkin.service", "failed"),
+        ])
+    })
+}
+
 fn reporting(server: &Server, pool: &Path) -> Reporting {
-    Reporting::new(config(server), pool, Ok(VM_ID.into()))
+    fixture_reporting(config(server), pool, Ok(VM_ID.into()))
 }
 
 pub(super) fn with_client(client: retry::Client, server: &Server, pool: &Path) -> Result<Azure> {
@@ -92,6 +110,23 @@ fn store(pool: &Path) -> KvpPoolStore {
     KvpPoolStore::new_in(KvpPool::Guest, pool, PoolMode::Safe).unwrap()
 }
 
+pub(super) fn messages(pool: &Path, name: &str) -> Vec<String> {
+    DiagnosticReader::new(store(pool))
+        .entries()
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| {
+            let Entry::Diagnostic(Diagnostic::Event(event)) = entry else {
+                return None;
+            };
+            match event.payload {
+                DiagnosticPayload::Text(text) if event.key.name == name => Some(text),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn report(store: &KvpPoolStore) -> ProvisioningReport {
     store.entries().unwrap()[PROVISIONING_REPORT_KEY]
         .parse()
@@ -110,6 +145,65 @@ fn has_outcome(store: &KvpPoolStore, name: &str, outcome: Outcome) -> bool {
         })
 }
 
+// Read the pool back, rather than assuming a successful KVP write means HTTP succeeded.
+fn assert_delivery_trace(store: &KvpPoolStore, acknowledged: bool) -> String {
+    let report = report(store);
+    let entries = DiagnosticReader::new(store.clone()).entries().unwrap();
+    let announced_ready = entries.iter().any(|entry| matches!(entry,
+        Entry::Diagnostic(Diagnostic::Event(event)) if event.key.name == "boot:ready"
+            && matches!(&event.payload, DiagnosticPayload::Text(text) if text == "Reporting provisioning complete")
+    ));
+    assert_eq!(announced_ready, report.result() == ReportResult::Success);
+    let mut traces = entries.iter().filter_map(|entry| match entry {
+        Entry::Diagnostic(Diagnostic::Event(event)) if event.key.name.starts_with("health:") => {
+            Some(event)
+        }
+        _ => None,
+    });
+    let tag = format!(
+        "result={} report_timestamp={}",
+        report.result(),
+        report.timestamp()
+    );
+    let state = if report.result() == ReportResult::Success {
+        "Ready"
+    } else {
+        "NotReady"
+    };
+    let send = traces.next().expect("missing initiation diagnostic");
+    assert_eq!(send.key.name, "health:send");
+    assert_eq!(send.result, None); // Intention to send is not a receipt.
+    assert_eq!(
+        send.payload,
+        DiagnosticPayload::Text(format!(
+            "Initiating health report to wireserver: {state} (JSON POST); {tag}"
+        ))
+    );
+    let trace = traces.next().expect("missing delivery diagnostic");
+    let (name, outcome) = if acknowledged {
+        ("health:acknowledged", Outcome::Ok)
+    } else {
+        ("health:unacknowledged", Outcome::Error)
+    };
+    assert_eq!(trace.key.name, name);
+    assert_eq!(trace.result, Some(outcome));
+    let DiagnosticPayload::Text(text) = &trace.payload else {
+        panic!("expected a text diagnostic")
+    };
+    assert!(text.contains(&tag));
+    if acknowledged {
+        assert!(text.starts_with("WireServer acknowledged health report"));
+        assert!(text.contains(&format!("Report '{state}' succeeded (HTTP 2xx)")));
+    } else {
+        assert!(text.starts_with("Failed to send provisioning report to wireserver"));
+    }
+    assert!(
+        traces.next().is_none(),
+        "contradictory or duplicate delivery trace"
+    );
+    text.clone()
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Request {
     path: String,
@@ -126,7 +220,7 @@ fn health(server: &mut Server, path: &str, status: usize) -> (Mock, Requests) {
         .with_status(status)
         .with_body_from_request(move |request| {
             captured.lock().unwrap().push(Request {
-                path: request.path().to_owned(),
+                path: request.path_and_query().to_owned(),
                 body: String::from_utf8(request.body().unwrap().to_vec()).unwrap(),
             });
             Vec::new()
@@ -163,20 +257,8 @@ fn evidence(name: &str, store: &KvpPoolStore, requests: &[Request], error: Optio
         "original_error": error.map(|error| format!("{error:#}")),
     });
     println!("\n=== Azure demo: {name} ===\n{outcome}");
-    for entry in &entries {
-        match entry {
-            Entry::Diagnostic(Diagnostic::Event(event)) => println!(
-                "DIAG {} outcome={:?} duration={:?} {:?}",
-                event.key.name, event.result, event.duration, event.payload
-            ),
-            Entry::Report(report) => {
-                println!(
-                    "PROVISIONING_REPORT {}",
-                    serde_json::to_string(report).unwrap()
-                );
-            }
-            _ => {}
-        }
+    for (key, value) in store.dump().unwrap() {
+        println!("{key}: {value}");
     }
     for request in requests {
         println!("POST {} {}", request.path, request.body);
@@ -210,27 +292,52 @@ fn azure_demo_success() {
     let pool = tempfile::tempdir().unwrap();
     let store = store(pool.path());
     let version = versions(&mut server);
+    let before_response = Arc::new(Mutex::new(Vec::new()));
+    let snapshot = Arc::clone(&before_response);
+    let directory = pool.path().to_owned();
     let hostname = server
         .mock("GET", HOSTNAME_PATH)
         .match_header("Metadata", "true")
-        .with_body("demo-host")
+        .with_body_from_request(move |_| {
+            *snapshot.lock().unwrap() = messages(&directory, "imds:hostname");
+            b"demo-node".to_vec()
+        })
         .create();
     let keys = server
         .mock("GET", KEYS_PATH)
         .match_header("Metadata", "true")
-        .with_body(GOOD_KEYS)
+        .with_body("[]")
+        .create();
+    let goalstate = server
+        .mock("GET", "/machine/?comp=goalstate")
+        .expect(0)
         .create();
     let (health, requests) = health(&mut server, "/provisioning/health", 200);
-    let provider = provider(&server, pool.path());
-    store.insert("unrelated", "preserved").unwrap();
 
-    assert_eq!(provider.hostname().unwrap().as_deref(), Some("demo-host"));
-    assert_eq!(provider.ssh_keys().unwrap().len(), 1);
+    let metadata = provider(&server, pool.path());
+    assert_eq!(metadata.hostname().unwrap().as_deref(), Some("demo-node"));
+    let get = format!("Fetching hostname from IMDS: GET http://169.254.169.254{HOSTNAME_PATH}");
+    assert_eq!(before_response.lock().unwrap().as_slice(), [get.as_str()]);
+    assert_eq!(
+        messages(pool.path(), "imds:hostname"),
+        [get.as_str(), "IMDS returned hostname: demo-node"]
+    );
+    assert!(metadata.ssh_keys().unwrap().is_empty());
+    assert_eq!(
+        messages(pool.path(), "imds:public-keys").last().unwrap(),
+        "Validated 0 SSH public key(s)"
+    );
+    for name in ["provider:init", "hostname", "ssh-keys"] {
+        assert!(has_outcome(&store, name, Outcome::Ok), "{name}");
+    }
     assert!(!store
         .entries()
         .unwrap()
         .contains_key(PROVISIONING_REPORT_KEY));
-    provider.boot_checkin().unwrap();
+    assert!(requests.lock().unwrap().is_empty());
+
+    // The later check-in uses the same guest pool but does not need to fetch metadata again.
+    reporting(&server, pool.path()).check_in().unwrap();
 
     assert_eq!(json_body(&requests), json!({"state": "Ready"}));
     let report = report(&store);
@@ -240,25 +347,184 @@ fn azure_demo_success() {
         report.agent(),
         concat!("afterburn/", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(store.entries().unwrap()["unrelated"], "preserved");
-    for name in [
-        "provider:init",
-        "hostname",
-        "ssh-keys",
-        "ssh-keys:parse",
-        "boot:check-in",
-    ] {
-        assert!(has_outcome(&store, name, Outcome::Ok), "{name}");
-    }
+    assert!(has_outcome(&store, "boot:services", Outcome::Ok));
+    assert!(assert_delivery_trace(&store, true).contains("protocol=Json attempts=1 xml_attempts=0"));
     version.assert();
     hostname.assert();
     keys.assert();
+    goalstate.assert();
     health.assert();
     evidence("success", &store, &requests.lock().unwrap(), None);
 }
 
 #[test]
-fn azure_demo_failure() {
+fn azure_hostname_diagnostics_do_not_export_unexpected_bodies() {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let _version = versions(&mut server);
+    let body = "demo-node\nunexpected second line";
+    let _hostname = server.mock("GET", HOSTNAME_PATH).with_body(body).create();
+    let metadata = provider(&server, pool.path());
+    assert_eq!(metadata.hostname().unwrap().as_deref(), Some(body));
+    assert_eq!(
+        messages(pool.path(), "imds:hostname").last().unwrap(),
+        "IMDS returned hostname: <omitted: unexpected label>"
+    );
+    assert!(store(pool.path())
+        .dump()
+        .unwrap()
+        .iter()
+        .all(|(_, v)| !v.contains("unexpected second line")));
+}
+
+#[test]
+fn azure_hostname_request_failure_records_url_but_no_returned_hostname() {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let _version = versions(&mut server);
+    let _hostname = server.mock("GET", HOSTNAME_PATH).with_status(403).create();
+    let (health, requests) = health(&mut server, "/provisioning/health", 200);
+    let err = provider(&server, pool.path()).hostname().unwrap_err();
+    assert!(format!("{err:#}").contains("failed to get hostname"));
+    assert_eq!(
+        messages(pool.path(), "imds:hostname"),
+        [
+            format!("Fetching hostname from IMDS: GET http://169.254.169.254{HOSTNAME_PATH}"),
+            "IMDS GET failed".to_owned()
+        ]
+    );
+    assert_eq!(json_body(&requests)["state"], "NotReady");
+    health.assert();
+}
+
+fn check_failed_service(query: boot_services::Query, expected: &str, scenario: &str) {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let store = store(pool.path());
+    let (health, requests) = health(&mut server, "/provisioning/health", 200);
+    let reporting = Reporting::new(config(&server), pool.path(), Ok(VM_ID.into()), query);
+
+    let error = reporting.check_in().unwrap_err();
+    assert!(error.to_string().contains(expected), "{error:#}");
+    let report = report(&store);
+    assert_eq!(report.result(), ReportResult::Error);
+    assert_eq!(report.reason(), Some(error.to_string().as_str()));
+    assert_eq!(
+        report.extra(),
+        &[("operation".into(), "boot:services".into())]
+    );
+    assert!(has_outcome(&store, "boot:services", Outcome::Error));
+    assert!(assert_delivery_trace(&store, true).contains("protocol=Json"));
+    assert_eq!(
+        json_body(&requests),
+        json!({"state":"NotReady","details":{
+            "subStatus":"ProvisioningFailed",
+            "description":store.entries().unwrap()[PROVISIONING_REPORT_KEY]
+        }})
+    );
+    health.assert(); // Exactly one POST: never Ready after reporting failure.
+    evidence(scenario, &store, &requests.lock().unwrap(), Some(&error));
+}
+
+#[test]
+fn azure_demo_failed_ignition_service() {
+    check_failed_service(
+        || Ok(vec![unit("ignition-fetch.service", "failed")]),
+        "ignition-fetch.service",
+        "ignition-failure",
+    );
+}
+
+#[test]
+#[ignore = "requires systemd with a failed ignition-demo-validate.service; see the demo runbook"]
+fn azure_live_failed_validator() {
+    check_failed_service(
+        boot_services::query,
+        "ignition-demo-validate.service",
+        "live-ignition-failure",
+    );
+}
+
+#[test]
+fn azure_unreadable_service_status_withholds_ready_without_inventing_a_failure() {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let store = store(pool.path());
+    let health = server
+        .mock("POST", "/provisioning/health")
+        .expect(0)
+        .create();
+    let reporting = Reporting::new(config(&server), pool.path(), Ok(VM_ID.into()), || {
+        anyhow::bail!("system bus unavailable")
+    });
+    let error = reporting.check_in().unwrap_err();
+    assert!(format!("{error:#}").contains("system bus unavailable"));
+    assert!(has_outcome(&store, "boot:services", Outcome::Error));
+    assert!(!store
+        .entries()
+        .unwrap()
+        .contains_key(PROVISIONING_REPORT_KEY));
+    health.assert();
+}
+
+#[test]
+fn azure_failed_units_keep_their_reason_when_http_fails() {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let store = store(pool.path());
+    let (health, requests) = health(&mut server, "/provisioning/health", 403);
+    let reporting = Reporting::new(config(&server), pool.path(), Ok(VM_ID.into()), || {
+        Ok(vec![
+            unit("NetworkManager-wait-online.service", "failed"),
+            unit("afterburn-sshkeys@private-user.service", "failed"),
+            unit("systemd-networkd.service", "failed"),
+            unit("ignition-files.service", "failed"),
+            unit("afterburn-firstboot-checkin.service", "failed"),
+        ])
+    });
+    let error = reporting.check_in().unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "systemd reports 4 failed boot service(s): ignition-files.service, NetworkManager-wait-online.service, afterburn-sshkeys@.service, systemd-networkd.service"
+    );
+    assert_eq!(report(&store).reason(), Some(error.as_str()));
+    assert!(assert_delivery_trace(&store, false).contains("Wireserver replied with status 403"));
+    assert_eq!(
+        json_body(&requests)["details"]["description"],
+        report(&store).encode()
+    );
+    health.assert();
+}
+
+#[test]
+fn azure_many_failed_units_still_fit_one_kvp_report() {
+    let mut server = Server::new();
+    let pool = tempfile::tempdir().unwrap();
+    let (health, requests) = health(&mut server, "/provisioning/health", 200);
+    let reporting = Reporting::new(config(&server), pool.path(), Ok(VM_ID.into()), || {
+        Ok((0..40)
+            .map(|i| {
+                unit(
+                    &format!("ignition-{}-{i}.service", "x".repeat(220)),
+                    "failed",
+                )
+            })
+            .collect())
+    });
+    let error = reporting.check_in().unwrap_err();
+    let report = report(&store(pool.path()));
+    assert_eq!(report.reason(), Some(error.to_string().as_str()));
+    assert!(error.to_string().contains("40 failed"));
+    assert!(error.to_string().contains("more unit names"));
+    assert_eq!(
+        json_body(&requests)["details"]["description"],
+        report.encode()
+    );
+    health.assert();
+}
+
+#[test]
+fn azure_metadata_failure() {
     let mut server = Server::new();
     let pool = tempfile::tempdir().unwrap();
     let store = store(pool.path());
@@ -271,6 +537,11 @@ fn azure_demo_failure() {
     let (health, requests) = health(&mut server, "/provisioning/health", 200);
     let provider = provider(&server, pool.path());
 
+    store.insert("unrelated", "preserved").unwrap();
+    assert!(!store
+        .entries()
+        .unwrap()
+        .contains_key(PROVISIONING_REPORT_KEY));
     let error = provider.ssh_keys().unwrap_err();
     assert!(format!("{error:#}").contains("failed to parse IMDS public key at index 0"));
     assert!(format!("{error:#}").contains("/home/core/.ssh/authorized_keys"));
@@ -284,8 +555,18 @@ fn azure_demo_failure() {
             "subStatus":"ProvisioningFailed","description":encoded
         }})
     );
-    assert!(has_outcome(&store, "ssh-keys:parse", Outcome::Error));
     assert!(has_outcome(&store, "ssh-keys", Outcome::Error));
+    let steps = messages(pool.path(), "imds:public-keys");
+    assert_eq!(
+        steps.last().unwrap(),
+        "SSH-key metadata did not pass validation"
+    );
+    assert!(store
+        .dump()
+        .unwrap()
+        .iter()
+        .all(|(_, v)| !v.contains("not-an-ssh-key") && !v.contains("/home/core/.ssh/")));
+    assert_delivery_trace(&store, true);
     provider.hostname().unwrap();
     assert!(provider
         .clone()
@@ -294,23 +575,23 @@ fn azure_demo_failure() {
         .to_string()
         .contains("refusing"));
     assert_eq!(store.entries().unwrap()[PROVISIONING_REPORT_KEY], encoded);
+    assert_eq!(store.entries().unwrap()["unrelated"], "preserved");
 
     version.assert();
     keys.assert();
     hostname.assert();
     health.assert();
-    evidence("failure", &store, &requests.lock().unwrap(), Some(&error));
 }
 
 #[test]
-fn azure_demo_xml_fallback() {
+fn azure_xml_fallback_preserves_report() {
     for status in [404, 405, 501] {
         for failed in [false, true] {
             let mut server = Server::new();
             let pool = tempfile::tempdir().unwrap();
             let store = store(pool.path());
             let version = versions(&mut server);
-            let (json_health, json_requests) = health(&mut server, "/provisioning/health", status);
+            let (json_health, _) = health(&mut server, "/provisioning/health", status);
             let goalstate = server
                 .mock("GET", "/machine/?comp=goalstate")
                 .match_header("x-ms-version", "2012-11-30")
@@ -319,13 +600,12 @@ fn azure_demo_xml_fallback() {
                 .create();
             let (xml_health, xml_requests) = health(&mut server, "/machine/?comp=health", 200);
             let provider = provider(&server, pool.path());
-            let error = if failed {
+            if failed {
                 let _keys = server.mock("GET", KEYS_PATH).with_body(BAD_KEYS).create();
-                Some(provider.ssh_keys().unwrap_err())
+                provider.ssh_keys().unwrap_err();
             } else {
                 provider.boot_checkin().unwrap();
-                None
-            };
+            }
             let requests = xml_requests.lock().unwrap();
             let xml = &requests[0].body;
             assert_eq!(
@@ -340,40 +620,14 @@ fn azure_demo_xml_fallback() {
                     store.entries().unwrap()[PROVISIONING_REPORT_KEY]
                 );
             }
-            let entries = DiagnosticReader::new(store.clone()).entries().unwrap();
-            assert!(entries.iter().any(|entry| matches!(
-                entry, Entry::Diagnostic(diagnostic)
-                    if diagnostic.key().name == "health:acknowledged"
-                        && format!("{:?}", diagnostic.payload()).contains("protocol=Xml")
-                        && format!("{:?}", diagnostic.payload()).contains(&status.to_string())
-            )));
+            let trace = assert_delivery_trace(&store, true);
+            assert!(trace.contains("protocol=Xml") && trace.contains(&status.to_string()));
             version.assert();
             json_health.assert();
             goalstate.assert();
             xml_health.assert();
-            if status == 404 && failed {
-                let mut all_requests = json_requests.lock().unwrap().clone();
-                all_requests.extend_from_slice(&requests);
-                evidence("xml-failure", &store, &all_requests, error.as_ref());
-            }
         }
     }
-}
-
-#[test]
-fn azure_checkin_does_not_negotiate_legacy_metadata() {
-    let mut server = Server::new();
-    let pool = tempfile::tempdir().unwrap();
-    let versions = server.mock("GET", "/?comp=versions").expect(0).create();
-    let goalstate = server
-        .mock("GET", "/machine/?comp=goalstate")
-        .expect(0)
-        .create();
-    let (health, _) = health(&mut server, "/provisioning/health", 200);
-    reporting(&server, pool.path()).check_in().unwrap();
-    versions.assert();
-    goalstate.assert();
-    health.assert();
 }
 
 #[test]
@@ -420,7 +674,7 @@ fn azure_other_http_errors_never_select_xml_or_repeat_kvp() {
             .mock("POST", "/machine/?comp=health")
             .expect(0)
             .create();
-        let reporting = Reporting::new(
+        let reporting = fixture_reporting(
             WireserverConfig {
                 max_attempts: Some(2),
                 ..config(&server)
@@ -431,6 +685,11 @@ fn azure_other_http_errors_never_select_xml_or_repeat_kvp() {
         reporting.check_in().unwrap_err();
         let store = store(pool.path());
         assert_eq!(report(&store).result(), ReportResult::Success);
+        let trace = assert_delivery_trace(&store, false);
+        assert!(
+            trace.contains(&format!("Wireserver replied with status {status}")),
+            "{trace}"
+        );
         assert_eq!(
             store
                 .dump()
@@ -496,7 +755,7 @@ fn azure_missing_identity_keeps_http_failure_reporting() {
     let mut server = Server::new();
     let pool = tempfile::tempdir().unwrap();
     let (health, requests) = health(&mut server, "/provisioning/health", 200);
-    let reporting = Reporting::new(
+    let reporting = fixture_reporting(
         config(&server),
         pool.path(),
         Err(io::Error::new(io::ErrorKind::NotFound, "no DMI UUID")),
@@ -521,7 +780,7 @@ fn azure_missing_identity_keeps_http_failure_reporting() {
 fn azure_reporting_setup_error_preserves_failure_but_rejects_checkin() {
     let server = Server::new();
     let pool = tempfile::tempdir().unwrap();
-    let reporting = Reporting::new(
+    let reporting = fixture_reporting(
         WireserverConfig {
             endpoint: "not a URL".into(),
             ..config(&server)
@@ -533,7 +792,7 @@ fn azure_reporting_setup_error_preserves_failure_but_rejects_checkin() {
         .operation("test:setup", || -> Result<()> { anyhow::bail!("original") })
         .unwrap_err();
     assert_eq!(error.to_string(), "original");
-    let another = Reporting::new(
+    let another = fixture_reporting(
         WireserverConfig {
             endpoint: "not a URL".into(),
             ..config(&server)
@@ -546,6 +805,17 @@ fn azure_reporting_setup_error_preserves_failure_but_rejects_checkin() {
         .unwrap_err()
         .to_string()
         .contains("unavailable"));
+    let entries = DiagnosticReader::new(store(pool.path())).entries().unwrap();
+    let delivery_events: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Diagnostic(diagnostic) if diagnostic.key().name.starts_with("health:") => {
+                Some(diagnostic.key().name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivery_events, ["health:unacknowledged"; 2]); // Neither report could be sent.
 }
 
 #[test]
@@ -563,7 +833,7 @@ fn azure_timeout_is_bounded_and_does_not_select_xml() {
         .mock("GET", "/machine/?comp=goalstate")
         .expect(0)
         .create();
-    let reporting = Reporting::new(
+    let reporting = fixture_reporting(
         WireserverConfig {
             request_timeout: Duration::from_millis(50),
             total_retry_timeout: Duration::from_millis(150),

@@ -68,7 +68,7 @@ tempfile = ">= 3.2, < 4"
 uzers = "0.12"
 vmw_backdoor = "0.2"
 xml = "1.4"
-zbus = ">= 2.3, < 6"
+zbus = "5.11"
 
 [dev-dependencies]
 mockito = "1"

@@ -2,7 +2,7 @@ use crate::providers::MetadataProvider;
 use crate::retry;
 use mockito::{self, Matcher};
 
-use super::reporting_tests::with_client;
+use super::reporting_tests::{messages, with_client};
 
 /// Response body for goalstate (with certificates endpoint).
 static GOALSTATE_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -278,6 +278,21 @@ fn test_attributes() {
         .mock_base_url(server.url());
     let provider = with_client(client, &server, pool.path()).unwrap();
     let attributes = provider.attributes().unwrap();
+    assert_eq!(
+        messages(pool.path(), "fabric:goalstate").last().unwrap(),
+        "Parsed goal state: 1 role instance(s)"
+    );
+    assert_eq!(
+        messages(pool.path(), "fabric:shared-config"),
+        [
+            "Fetching shared configuration from the URL in goal state",
+            "Parsed shared configuration: 1 instance(s)",
+        ]
+    );
+    assert_eq!(
+        messages(pool.path(), "imds:vm-size").last().unwrap(),
+        "IMDS returned VM size: testvmsize"
+    );
     let r = attributes.get("AZURE_VMSIZE");
     let ip = attributes.get("AZURE_IPV4_DYNAMIC");
 
@@ -361,6 +376,11 @@ fn test_imds_fetch_ssh_keys() {
 
     m_imds.assert();
     assert_eq!(keys.len(), 1);
+    let steps = messages(pool.path(), "imds:public-keys");
+    assert_eq!(steps.last().unwrap(), "Validated 1 SSH public key(s)");
+    assert!(steps
+        .iter()
+        .all(|step| !step.contains("ssh-rsa") && !step.contains("authorized_keys")));
 }
 
 #[test]
@@ -396,6 +416,9 @@ fn test_imds_fetch_admin_username() {
     m_imds.assert();
     // Whitespace and a trailing newline should be trimmed off.
     assert_eq!(username.as_deref(), Some("azureuser"));
+    let steps = messages(pool.path(), "imds:admin-username");
+    assert_eq!(steps.last().unwrap(), "IMDS provided an admin username");
+    assert!(steps.iter().all(|step| !step.contains("azureuser")));
 }
 
 #[test]
@@ -414,4 +437,8 @@ fn test_imds_fetch_admin_username_empty_body() {
     m_imds.assert();
     // Whitespace-only payload should be treated as "no admin username".
     assert_eq!(username, None);
+    assert_eq!(
+        messages(pool.path(), "imds:admin-username").last().unwrap(),
+        "IMDS did not provide an admin username"
+    );
 }

@@ -15,25 +15,40 @@
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use libazureinit_kvp::{
-    read_vm_id, DiagnosticWriter, HealthDelivery, HealthWriteError, HealthWriter,
-    HealthWriterBuildError, KvpPool, KvpPoolStore, Outcome, PoolMode, ProvisioningReport,
-    ReportPpsType, WireserverConfig, WireserverDelivery,
+    read_vm_id, DiagnosticWriter, HealthWriteError, HealthWriter, HealthWriterBuildError, KvpPool,
+    KvpPoolStore, Outcome, PoolMode, ProvisioningReport, ReportPpsType, ReportResult,
+    WireserverConfig, WireserverError,
 };
 use slog_scope::{info, warn};
 
+use super::boot_services;
+
 const AGENT: &str = concat!("afterburn/", env!("CARGO_PKG_VERSION"));
 
-#[derive(Clone, Debug)]
+fn response_status(error: &WireserverError) -> Option<u16> {
+    match error {
+        WireserverError::HttpStatus { status, .. } => Some(status.as_u16()),
+        WireserverError::AttemptsExhausted { last_error, .. }
+        | WireserverError::Timeout {
+            last_error: Some(last_error),
+            ..
+        } => response_status(last_error),
+        WireserverError::Fallback { xml, .. } => response_status(xml),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct Reporting {
-    health: Result<HealthWriter, Arc<HealthWriterBuildError>>,
+    health: Result<HealthWriter, HealthWriterBuildError>,
     diagnostics: Option<DiagnosticWriter>,
     vm_id: String,
-    failed: Arc<AtomicBool>,
+    failed: AtomicBool,
+    boot_units: boot_services::Query,
 }
 
 impl Reporting {
@@ -51,6 +66,7 @@ impl Reporting {
             },
             Path::new("/var/lib/hyperv"),
             read_vm_id(),
+            boot_services::query,
         )
     }
 
@@ -58,6 +74,7 @@ impl Reporting {
         config: WireserverConfig,
         pool_directory: &Path,
         identity: io::Result<String>,
+        boot_units: boot_services::Query,
     ) -> Self {
         let (vm_id, store) = match identity {
             Ok(vm_id) => {
@@ -89,19 +106,23 @@ impl Reporting {
         if let Some(store) = store {
             builder = builder.kvp(store);
         }
-        let health = builder.build().map_err(|error| {
+        let health = builder.build().inspect_err(|error| {
             warn!("Could not configure Azure health reporting: {error}");
-            Arc::new(error)
         });
         Self {
             health,
             diagnostics,
             vm_id,
-            failed: Arc::new(AtomicBool::new(false)),
+            failed: AtomicBool::new(false),
+            boot_units,
         }
     }
 
-    pub(super) fn event(
+    pub(super) fn note(&self, name: &str, message: impl Into<String>) {
+        self.event(name, message, None, None);
+    }
+
+    fn event(
         &self,
         name: &str,
         message: impl Into<String>,
@@ -115,12 +136,7 @@ impl Reporting {
         }
     }
 
-    pub(super) fn observe<T>(
-        &self,
-        name: &str,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        self.event(name, "starting", None, None);
+    fn observe<T>(&self, name: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let started = Instant::now();
         let result = operation();
         let (message, outcome) = if result.is_ok() {
@@ -139,73 +155,135 @@ impl Reporting {
     ) -> Result<T> {
         let result = self.observe(name, operation);
         if let Err(error) = &result {
-            self.failed.store(true, Ordering::Relaxed);
             warn!("Azure operation failed"; "operation" => name, "error" => format!("{error:#}"));
             // Metadata errors can contain credentials or untrusted payloads.
-            let report = ProvisioningReport::failure(
-                AGENT,
-                &self.vm_id,
-                format!("Azure {name} failed; see the guest journal for details"),
-                ReportPpsType::None,
-            )
-            .with_extra("operation", name);
-            match &self.health {
-                Ok(health) => {
-                    if let Err(error) = self.acknowledge(health.write_report(&report)) {
-                        warn!("Could not publish Azure provisioning failure: {error:#}");
-                    }
-                }
-                Err(error) => warn!("Azure failure reporting is unavailable: {error}"),
-            }
+            self.publish_failure(
+                name,
+                &format!("Azure {name} failed; see the guest journal for details"),
+            );
         }
         result
     }
 
+    fn publish_failure(&self, operation: &str, reason: &str) {
+        self.failed.store(true, Ordering::Relaxed);
+        let report = ProvisioningReport::failure(AGENT, &self.vm_id, reason, ReportPpsType::None)
+            .with_extra("operation", operation);
+        if let Err(error) = self.publish(&report) {
+            warn!("Could not deliver Azure provisioning failure: {error:#}");
+        }
+    }
+
+    fn check_boot_services(&self) -> Result<()> {
+        let started = Instant::now();
+        let units = (self.boot_units)().map_err(|error| {
+            let message = "Could not read systemd boot service status; withholding Azure readiness";
+            self.event(
+                "boot:services",
+                message,
+                Some(Outcome::Error),
+                Some(started.elapsed()),
+            );
+            error.context(message)
+        })?;
+        if let Some(reason) = boot_services::failure_reason(units) {
+            self.event(
+                "boot:services",
+                &reason,
+                Some(Outcome::Error),
+                Some(started.elapsed()),
+            );
+            self.publish_failure("boot:services", &reason);
+            bail!("{reason}");
+        }
+        self.event(
+            "boot:services",
+            "No watched boot services are currently failed",
+            Some(Outcome::Ok),
+            Some(started.elapsed()),
+        );
+        Ok(())
+    }
+
     pub(super) fn check_in(&self) -> Result<()> {
+        self.event(
+            "boot:check-in",
+            "Afterburn is checking Azure boot readiness",
+            None,
+            None,
+        );
         self.observe("boot:check-in", || {
             if self.failed.load(Ordering::Relaxed) {
                 bail!("refusing Azure readiness after an unrecovered error in this provider");
             }
-            let health = self
-                .health
-                .as_ref()
-                .map_err(|error| anyhow!("Azure health reporting is unavailable: {error}"))?;
-            self.acknowledge(health.report_success(ReportPpsType::None))
+            self.check_boot_services()?;
+            self.event("boot:ready", "Reporting provisioning complete", None, None);
+            self.publish(&ProvisioningReport::success(
+                AGENT,
+                &self.vm_id,
+                ReportPpsType::None,
+            ))
         })
     }
 
-    fn acknowledge(&self, result: Result<HealthDelivery, HealthWriteError>) -> Result<()> {
-        let delivery = match result {
-            Ok(HealthDelivery {
-                wireserver: Some(delivery),
-                ..
-            }) => delivery,
-            Ok(_) => bail!("Azure check-in requires an HTTP acknowledgement"),
-            Err(HealthWriteError::Kvp {
-                error,
-                wireserver: Some(delivery),
-            }) => {
-                warn!("Azure KVP report failed, but HTTP acknowledged the report: {error}");
-                delivery
-            }
-            Err(error) => {
-                warn!("Azure health delivery failed: {error:?}");
-                return Err(error.into());
-            }
-        };
-        self.delivered(delivery);
-        Ok(())
-    }
-
-    fn delivered(&self, delivery: WireserverDelivery) {
-        let message = format!(
-            "protocol={:?}, JSON attempts={}, XML attempts={}, fallback status={:?}",
-            delivery.protocol,
-            delivery.json_attempts,
-            delivery.xml_attempts,
-            delivery.fallback_status,
+    fn publish(&self, report: &ProvisioningReport) -> Result<()> {
+        // The report key is replaced on each publication; diagnostic records are appended.
+        let tag = format!(
+            "result={} report_timestamp={}",
+            report.result(),
+            report.timestamp()
         );
-        info!("Azure health acknowledged: {message}");
+        let state = match report.result() {
+            ReportResult::Success => "Ready",
+            ReportResult::Error | ReportResult::InProgress => "NotReady",
+        };
+        let ack = self
+            .health
+            .as_ref()
+            .map_err(|error| anyhow!("Azure health reporting is unavailable: {error}"))
+            .and_then(|health| {
+                self.event(
+                    "health:send",
+                    format!("Initiating health report to wireserver: {state} (JSON POST); {tag}"),
+                    None,
+                    None,
+                );
+                match health.write_report(report) {
+                    Ok(delivery) => delivery
+                        .wireserver
+                        .context("Azure check-in requires an HTTP acknowledgement"),
+                    Err(HealthWriteError::Kvp {
+                        error,
+                        wireserver: Some(ack),
+                    }) => {
+                        warn!("Azure KVP report failed, but WireServer acknowledged it: {error}");
+                        Ok(ack)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .inspect_err(|error| {
+                // Include status when the transport actually returned one; not the response body.
+                let status = error
+                    .chain()
+                    .find_map(|cause| response_status(cause.downcast_ref::<WireserverError>()?))
+                    .map(|code| format!("; Wireserver replied with status {code}"))
+                    .unwrap_or_default();
+                self.event(
+                    "health:unacknowledged",
+                    format!(
+                        "Failed to send provisioning report to wireserver: {state}; {tag}{status}"
+                    ),
+                    Some(Outcome::Error),
+                    None,
+                );
+            })?;
+        let message = format!(
+            "WireServer acknowledged health report: Report '{state}' succeeded (HTTP 2xx); protocol={:?} attempts={} xml_attempts={} fallback_status={:?}; {tag}",
+            ack.protocol, ack.json_attempts, ack.xml_attempts, ack.fallback_status,
+        );
+        info!("{message}");
         self.event("health:acknowledged", message, Some(Outcome::Ok), None);
+        Ok(())
     }
 }
