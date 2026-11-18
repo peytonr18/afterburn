@@ -56,6 +56,20 @@ impl CliMulti {
             slog_scope::warn!("multi: no action specified");
         }
 
+        // JSON health reporting does not require legacy metadata negotiation.
+        if provider == "azure"
+            && self.check_in
+            && self.attributes_file.is_none()
+            && self.ssh_keys_user.is_none()
+            && self.hostname_file.is_none()
+            && self.network_units_dir.is_none()
+            && self.netplan_config_dir.is_none()
+            && self.networkmanager_profiles_dir.is_none()
+        {
+            return crate::providers::microsoft::azure::Azure::check_in()
+                .context("checking-in instance boot to cloud provider");
+        }
+
         // fetch the metadata from the configured provider
         let metadata =
             metadata::fetch_metadata(&provider).context("fetching metadata from provider")?;

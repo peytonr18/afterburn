@@ -1,6 +1,8 @@
-use crate::providers::{microsoft::azure, MetadataProvider};
+use crate::providers::MetadataProvider;
 use crate::retry;
 use mockito::{self, Matcher};
+
+use super::reporting_tests::with_client;
 
 /// Response body for goalstate (with certificates endpoint).
 static GOALSTATE_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -186,29 +188,24 @@ fn mock_imds_admin_username(server: &mut mockito::Server, body: &str) -> mockito
 #[test]
 fn test_boot_checkin() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let m_version = mock_fab_version(&mut server);
-    let m_goalstate = mock_goalstate(&mut server, true);
 
-    let fab_health = "/machine/?comp=health";
+    let fab_health = "/provisioning/health";
     let m_health = server
         .mock("POST", fab_health)
-        .match_header("content-type", Matcher::Regex("text/xml".to_string()))
-        .match_header("x-ms-version", Matcher::Regex("2012-11-30".to_string()))
-        .match_body(Matcher::Regex("<State>Ready</State>".to_string()))
-        .match_body(Matcher::Regex(
-            "<GoalStateIncarnation>42</GoalStateIncarnation>".to_string(),
-        ))
+        .match_header("content-type", "application/json")
+        .match_body(Matcher::Json(serde_json::json!({"state": "Ready"})))
         .with_status(200)
         .create();
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let r = provider.boot_checkin();
 
     m_version.assert();
-    m_goalstate.assert();
     m_health.assert();
     r.unwrap();
 
@@ -219,12 +216,13 @@ fn test_boot_checkin() {
         .unwrap()
         .max_retries(0)
         .mock_base_url(server.url());
-    azure::Azure::with_client(Some(client)).unwrap_err();
+    with_client(client, &server, pool.path()).unwrap_err();
 }
 
 #[test]
 fn test_hostname() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let m_version = mock_fab_version(&mut server);
 
     let testname = "testname";
@@ -239,7 +237,7 @@ fn test_hostname() {
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let r = provider.hostname().unwrap();
 
     m_version.assert();
@@ -255,12 +253,13 @@ fn test_hostname() {
         .unwrap()
         .max_retries(0)
         .mock_base_url(server.url());
-    azure::Azure::with_client(Some(client)).unwrap_err();
+    with_client(client, &server, pool.path()).unwrap_err();
 }
 
 #[test]
 fn test_attributes() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let m_version = mock_fab_version(&mut server);
     let m_goalstate = mock_goalstate(&mut server, false);
     let m_shared_config = mock_shared_config(&mut server);
@@ -277,7 +276,7 @@ fn test_attributes() {
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let attributes = provider.attributes().unwrap();
     let r = attributes.get("AZURE_VMSIZE");
     let ip = attributes.get("AZURE_IPV4_DYNAMIC");
@@ -300,19 +299,20 @@ fn test_attributes() {
         .unwrap()
         .max_retries(0)
         .mock_base_url(server.url());
-    azure::Azure::with_client(Some(client)).unwrap_err();
+    with_client(client, &server, pool.path()).unwrap_err();
 }
 
 #[test]
 fn test_goalstate_certs() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let m_version = mock_fab_version(&mut server);
     let m_goalstate = mock_goalstate(&mut server, true);
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let goalstate = provider.fetch_goalstate().unwrap();
 
     m_version.assert();
@@ -328,13 +328,14 @@ fn test_goalstate_certs() {
 #[test]
 fn test_goalstate_no_certs() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let m_version = mock_fab_version(&mut server);
     let m_goalstate = mock_goalstate(&mut server, false);
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let goalstate = provider.fetch_goalstate().unwrap();
 
     m_version.assert();
@@ -348,13 +349,14 @@ fn test_goalstate_no_certs() {
 #[test]
 fn test_imds_fetch_ssh_keys() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let _m_version = mock_fab_version(&mut server);
     let m_imds = mock_imds_public_keys(&mut server, IMDS_BODY_WITH_KEY);
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let keys = provider.fetch_ssh_keys().unwrap();
 
     m_imds.assert();
@@ -364,13 +366,14 @@ fn test_imds_fetch_ssh_keys() {
 #[test]
 fn test_imds_fetch_empty_ssh_keys() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let _m_version = mock_fab_version(&mut server);
     let m_imds = mock_imds_public_keys(&mut server, IMDS_BODY_NO_KEYS);
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let keys = provider.fetch_ssh_keys().unwrap();
 
     m_imds.assert();
@@ -380,13 +383,14 @@ fn test_imds_fetch_empty_ssh_keys() {
 #[test]
 fn test_imds_fetch_admin_username() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let _m_version = mock_fab_version(&mut server);
     let m_imds = mock_imds_admin_username(&mut server, "  azureuser\n");
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let username = provider.admin_username().unwrap();
 
     m_imds.assert();
@@ -397,13 +401,14 @@ fn test_imds_fetch_admin_username() {
 #[test]
 fn test_imds_fetch_admin_username_empty_body() {
     let mut server = mockito::Server::new();
+    let pool = tempfile::tempdir().unwrap();
     let _m_version = mock_fab_version(&mut server);
     let m_imds = mock_imds_admin_username(&mut server, "   \n");
 
     let client = retry::Client::try_new()
         .unwrap()
         .mock_base_url(server.url());
-    let provider = azure::Azure::with_client(Some(client)).unwrap();
+    let provider = with_client(client, &server, pool.path()).unwrap();
     let username = provider.admin_username().unwrap();
 
     m_imds.assert();

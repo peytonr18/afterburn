@@ -15,13 +15,16 @@
 //! Azure provider, metadata and wireserver fetcher.
 
 pub(crate) mod config;
+mod reporting;
 
 use super::goalstate;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use libazureinit_kvp::Outcome;
 use openssh_keys::PublicKey;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -30,9 +33,12 @@ use slog_scope::warn;
 use crate::providers::MetadataProvider;
 use crate::retry;
 use nix::unistd::Uid;
+use reporting::Reporting;
 
 #[cfg(test)]
 mod mock_tests;
+#[cfg(test)]
+mod reporting_tests;
 
 static HDR_AGENT_NAME: &str = "x-ms-agent-name";
 static HDR_VERSION: &str = "x-ms-version";
@@ -44,28 +50,6 @@ const MS_VERSION: &str = "2012-11-30";
 /// See: https://blogs.msdn.microsoft.com/mast/2015/05/18/what-is-the-ip-address-168-63-129-16/
 #[cfg(not(test))]
 const FALLBACK_WIRESERVER_ADDR: [u8; 4] = [168, 63, 129, 16]; // for grep: 168.63.129.16
-
-macro_rules! ready_state {
-    ($container:expr, $instance:expr, $incarnation:expr) => {
-        format!(r#"<?xml version="1.0" encoding="utf-8"?>
-<Health xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <GoalStateIncarnation>{}</GoalStateIncarnation>
-  <Container>
-    <ContainerId>{}</ContainerId>
-    <RoleInstanceList>
-      <Role>
-        <InstanceId>{}</InstanceId>
-        <Health>
-          <State>Ready</State>
-        </Health>
-      </Role>
-    </RoleInstanceList>
-  </Container>
-</Health>
-"#,
-                $incarnation, $container, $instance)
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 struct Versions {
@@ -83,6 +67,7 @@ struct Supported {
 pub struct Azure {
     client: retry::Client,
     endpoint: IpAddr,
+    reporting: Reporting,
 }
 
 #[derive(Debug, Default)]
@@ -142,64 +127,83 @@ impl Azure {
     ///
     /// This internally tries to reach the WireServer and verify compatibility.
     pub fn try_new() -> Result<Self> {
-        Self::with_client(None)
+        let (endpoint, reporting) = Self::platform_reporting();
+        Self::with_client(None, endpoint, reporting)
     }
 
-    /// Try to build a new provider agent for Azure, with a given client.
-    pub(crate) fn with_client(client: Option<retry::Client>) -> Result<Azure> {
-        let wireserver_ip = Azure::get_fabric_address();
-        Self::verify_platform(client, wireserver_ip)
+    pub(crate) fn check_in() -> Result<()> {
+        let (_, reporting) = Self::platform_reporting();
+        reporting.check_in()
     }
 
-    /// Try to reach cloud endpoint to ensure we are on a compatible Azure platform.
-    pub(crate) fn verify_platform(
+    fn platform_reporting() -> (IpAddr, Reporting) {
+        let started = Instant::now();
+        let endpoint = Self::get_fabric_address();
+        let reporting = Reporting::for_endpoint(format!("http://{endpoint}/provisioning/health"));
+        reporting.event(
+            "fabric:discovery",
+            format!("selected WireServer address {endpoint}"),
+            Some(Outcome::Ok),
+            Some(started.elapsed()),
+        );
+        (endpoint, reporting)
+    }
+
+    fn with_client(
         client: Option<retry::Client>,
         endpoint: IpAddr,
+        reporting: Reporting,
     ) -> Result<Azure> {
-        let mut client = match client {
-            Some(c) => c,
-            None => retry::Client::try_new()?,
-        };
+        reporting.clone().operation("provider:init", || {
+            let mut client = match client {
+                Some(c) => c,
+                None => retry::Client::try_new()?,
+            };
 
-        // Add headers required by API.
-        client = client
-            .header(
-                HeaderName::from_static(HDR_AGENT_NAME),
-                HeaderValue::from_static(MS_AGENT_NAME),
-            )
-            .header(
-                HeaderName::from_static(HDR_VERSION),
-                HeaderValue::from_static(MS_VERSION),
-            );
+            // Add headers required by the metadata API.
+            client = client
+                .header(
+                    HeaderName::from_static(HDR_AGENT_NAME),
+                    HeaderValue::from_static(MS_AGENT_NAME),
+                )
+                .header(
+                    HeaderName::from_static(HDR_VERSION),
+                    HeaderValue::from_static(MS_VERSION),
+                );
 
-        let azure = Azure { client, endpoint };
+            let azure = Azure {
+                client,
+                endpoint,
+                reporting,
+            };
 
-        // Make sure WireServer API version is compatible with our logic.
-        azure
-            .is_fabric_compatible(MS_VERSION)
-            .inspect_err(|_e| {
-                let is_root = Uid::current().is_root();
-                if !is_root {
-                    // Firewall rules may be blocking requests from non-root
-                    // processes, see https://github.com/coreos/bugs/issues/2468.
-                    warn!("unable to reach Azure endpoints, please check whether firewall rules are blocking access to them");
-                }
-            })
-            .context("failed version compatibility check")?;
+            azure
+                .reporting
+                .observe("fabric:versions", || azure.is_fabric_compatible(MS_VERSION))
+                .inspect_err(|_e| {
+                    if !Uid::current().is_root() {
+                        // See https://github.com/coreos/bugs/issues/2468.
+                        warn!("unable to reach Azure endpoints, please check whether firewall rules are blocking access to them");
+                    }
+                })
+                .context("failed version compatibility check")?;
 
-        Ok(azure)
+            Ok(azure)
+        })
     }
 
     /// Retrieve `goalstate` content from the WireServer.
     fn fetch_goalstate(&self) -> Result<goalstate::GoalState> {
-        self.client
-            .get(
-                retry::Xml,
-                format!("{}/machine/?comp=goalstate", self.fabric_base_url()),
-            )
-            .send()
-            .context("failed to get goal state")?
-            .ok_or_else(|| anyhow!("failed to get goal state: not found response"))
+        self.reporting.observe("fabric:goalstate", || {
+            self.client
+                .get(
+                    retry::Xml,
+                    format!("{}/machine/?comp=goalstate", self.fabric_base_url()),
+                )
+                .send()
+                .context("failed to get goal state")?
+                .ok_or_else(|| anyhow!("failed to get goal state: not found response"))
+        })
     }
 
     #[cfg(not(test))]
@@ -264,16 +268,23 @@ impl Azure {
         use std::net::SocketAddr;
 
         let goalstate = self.fetch_goalstate()?;
-        let endpoint = &goalstate.container.role_instance_list.role_instances[0]
+        let endpoint = &goalstate
+            .container
+            .role_instance_list
+            .role_instances
+            .first()
+            .context("goal state has no role instances")?
             .configuration
             .shared_config;
 
-        let shared_config: goalstate::SharedConfig = self
-            .client
-            .get(retry::Xml, endpoint.to_string())
-            .send()
-            .context("failed to get shared configuration")?
-            .ok_or_else(|| anyhow!("failed to get shared configuration: not found"))?;
+        let shared_config: goalstate::SharedConfig =
+            self.reporting.observe("fabric:shared-config", || {
+                self.client
+                    .get(retry::Xml, endpoint.to_string())
+                    .send()
+                    .context("failed to get shared configuration")?
+                    .ok_or_else(|| anyhow!("failed to get shared configuration: not found"))
+            })?;
 
         let mut attributes = Attributes::default();
 
@@ -368,73 +379,73 @@ impl Azure {
             .context("failed to query IMDS for publicKeys")?
             .ok_or_else(|| anyhow::anyhow!("IMDS did not return a publicKeys payload"))?;
 
-        parse_imds_public_keys(&body)
-    }
-
-    /// Report ready state to the WireServer.
-    ///
-    /// This is used to signal to the cloud platform that the VM has
-    /// booted into userland. The definition of "ready" is fuzzy.
-    fn report_ready_state(&self) -> Result<()> {
-        let goalstate = self.fetch_goalstate()?;
-        let body = ready_state!(
-            goalstate.container_id(),
-            goalstate.instance_id()?,
-            goalstate.incarnation()
+        self.reporting.event(
+            "imds:public-keys",
+            "received SSH-key metadata; validating keys",
+            None,
+            None,
         );
-        let url = self.fabric_base_url() + "/machine/?comp=health";
-        self.client
-            .post(retry::Xml, url, Some(body.into()))
-            .dispatch_post()?;
-        Ok(())
+        let keys = self
+            .reporting
+            .observe("ssh-keys:parse", || parse_imds_public_keys(&body))?;
+        self.reporting.event(
+            "ssh-keys:count",
+            format!("validated {} SSH keys", keys.len()),
+            Some(Outcome::Ok),
+            None,
+        );
+        Ok(keys)
     }
 }
 
 impl MetadataProvider for Azure {
     fn attributes(&self) -> Result<HashMap<String, String>> {
-        let attributes = self.get_attributes()?;
-        let vmsize = self.fetch_vmsize()?;
-        let mut out = HashMap::with_capacity(3);
+        self.reporting.operation("attributes", || {
+            let attributes = self.get_attributes()?;
+            let vmsize = self
+                .reporting
+                .observe("imds:vm-size", || self.fetch_vmsize())?;
+            let mut out = HashMap::with_capacity(3);
 
-        if let Some(virtual_ipv4) = attributes.virtual_ipv4 {
-            out.insert("AZURE_IPV4_VIRTUAL".to_string(), virtual_ipv4.to_string());
-        }
+            if let Some(virtual_ipv4) = attributes.virtual_ipv4 {
+                out.insert("AZURE_IPV4_VIRTUAL".to_string(), virtual_ipv4.to_string());
+            }
 
-        if let Some(dynamic_ipv4) = attributes.dynamic_ipv4 {
-            out.insert("AZURE_IPV4_DYNAMIC".to_string(), dynamic_ipv4.to_string());
-        }
+            if let Some(dynamic_ipv4) = attributes.dynamic_ipv4 {
+                out.insert("AZURE_IPV4_DYNAMIC".to_string(), dynamic_ipv4.to_string());
+            }
 
-        out.insert("AZURE_VMSIZE".to_string(), vmsize);
+            out.insert("AZURE_VMSIZE".to_string(), vmsize);
 
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn hostname(&self) -> Result<Option<String>> {
-        self.fetch_hostname()
+        self.reporting
+            .operation("hostname", || self.fetch_hostname())
     }
 
     fn admin_username(&self) -> Result<Option<String>> {
-        self.fetch_admin_username()
+        self.reporting
+            .operation("admin:username", || self.fetch_admin_username())
     }
 
     fn admin_password_hash(&self) -> Result<Option<String>> {
-        config::read_ovf_admin_password()?
-            .map(|password| config::hash_admin_password(&password))
-            .transpose()
+        self.reporting.operation("admin:password-hash", || {
+            config::read_ovf_admin_password()?
+                .map(|password| config::hash_admin_password(&password))
+                .transpose()
+        })
     }
 
     fn ssh_keys(&self) -> Result<Vec<PublicKey>> {
-        self.fetch_ssh_keys()
+        self.reporting
+            .operation("ssh-keys", || self.fetch_ssh_keys())
     }
 
     fn boot_checkin(&self) -> Result<()> {
-        let controller = retry::Retry::new().max_retries(5);
-        controller.retry(|n| {
-            if n > 0 {
-                warn!("Retrying ready state report: Attempt #{}", n);
-            }
-            self.report_ready_state()
-        })
+        self.reporting.check_in()
     }
 }
 

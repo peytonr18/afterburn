@@ -12,6 +12,7 @@ Major changes:
 
 Minor changes:
 
+- Azure: Emit KVP diagnostics and report provisioning health through libazureinit-kvp
 - Reuse the existing HTTP client when building PATCH, PUT, and POST requests
 - Azure: Read the admin password from OVF `UserPassword` when rendering the platform-user Ignition fragment
 - Azure: Support configurable platform-user groups via `--user-group`
