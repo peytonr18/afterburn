@@ -6,6 +6,8 @@ ConditionKernelCommandLine=|ignition.platform.id=azurestack
 ConditionKernelCommandLine=|ignition.platform.id=scaleway
 After=network.target
 After=multi-user.target boot-complete.target
+# Order after the KVP daemon if it is scheduled, without pulling it onto other clouds.
+After=hypervkvpd.service
 
 [Service]
 Environment=AFTERBURN_OPT_PROVIDER=--cmdline

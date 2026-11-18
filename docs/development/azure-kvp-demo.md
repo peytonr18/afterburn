@@ -116,8 +116,16 @@ KVP="$PWD/target/azure-kvp-tools/bin/libazureinit-kvp"
   the metadata invocations you want to observe **and** the enabled Azure
   [check-in service](../../systemd/afterburn-checkin.service) use the demo
   binary. This repo's unit expects `/usr/bin/afterburn` and `ignition.platform.id=azure`.
-- Make `/var/lib/hyperv` writable by Afterburn and available to the guest KVP
-  daemon for host collection. For a manual emergency-shell demo, include the
+- Use your normal image build. **No Make flag, drop-in or guest setup is
+  required for KVP readiness.** The Azure binary handles it even when the image
+  supplies its own check-in unit. On the real root filesystem, if the VM UUID
+  is available but `/var/lib/hyperv` is missing, it asks systemd to start
+  `hypervkvpd.service` and waits up to 30 seconds for the directory. An existing
+  directory needs no wait or daemon start. Afterburn does not create, chmod or
+  clear that directory. The image still needs its usual Hyper-V daemon for host
+  collection. If the start request is denied it still waits, since the image
+  may have scheduled the daemon independently. A KVP timeout does not suppress HTTP.
+- For a manual emergency-shell demo, include the
   binary and its libraries in the initramfs too. An initramfs-only pool is not
   automatically the pool the post-boot daemon reads.
 
@@ -171,6 +179,41 @@ the create request is **not** a check-in acknowledgement.
    pool may disappear at switch-root and HTTP requires WireServer reachability.
    Label this **manual reporting after a real first-boot failure**, not automatic
    delivery. If the binary or failed state is unavailable, use the local demo.
+
+### WireServer acknowledged Ready but the guest pool is empty
+
+`Could not write Azure diagnostic: No such file or directory` followed by
+`Azure KVP report failed, but WireServer acknowledged it` means **HTTP succeeded,
+KVP did not**. The writer can create `.kvp_pool_1` but not its parent directory.
+Check both units on the **same boot** and use the daemon name from the guest:
+
+```sh
+sudo journalctl -b -o short-monotonic --no-pager -l \
+  -u afterburn-checkin.service -u hypervkvpd.service
+systemctl show hypervkvpd.service -p Type -p ActiveState
+sudo stat /var/lib/hyperv /var/lib/hyperv/.kvp_pool_1
+```
+
+Seeing `afterburn-checkin.service` in the journal doesn't tell you which unit
+file the image packaged. `systemctl cat afterburn-checkin.service` shows its
+source and `ExecStart`; what matters is that this command runs the new binary.
+The repo's unit also orders itself after `hypervkvpd.service` when both jobs
+are scheduled. The binary checks for the directory itself, since a daemon
+being marked started is not proof its files are ready.
+
+On an **older disposable good VM only**, if the daemon is now active and the
+directory exists, you can confirm the diagnosis without rebuilding:
+
+```sh
+sudo systemctl restart afterburn-checkin.service
+sudo /path/to/libazureinit-kvp --dir /var/lib/hyperv --pool guest dump --parse
+```
+
+Restarting deliberately sends a **new** health report; save existing evidence
+first. This restart is **not** part of the new image setup. Lost diagnostics are
+not replayed. Initramfs invocations do not wait for a post-switch-root daemon.
+If the pool exists but is still empty,
+check the full error, write permissions, mount namespace and SELinux policy.
 
 ## 3. Optional middle ground: real systemd, no broken boot or Azure account
 

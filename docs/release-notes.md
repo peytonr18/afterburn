@@ -13,6 +13,7 @@ Major changes:
 Minor changes:
 
 - Azure: Emit KVP diagnostics for metadata requests and their results, and report provisioning health through libazureinit-kvp, including watched systemd boot services that are failed at check-in
+- Azure: Wait for the KVP daemon to prepare a missing guest pool directory before root-filesystem reporting, without requiring image-specific setup
 - Reuse the existing HTTP client when building PATCH, PUT, and POST requests
 - Azure: Read the admin password from OVF `UserPassword` when rendering the platform-user Ignition fragment
 - Azure: Support configurable platform-user groups via `--user-group`

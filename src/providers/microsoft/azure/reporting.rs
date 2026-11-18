@@ -29,6 +29,43 @@ use super::boot_services;
 
 const AGENT: &str = concat!("afterburn/", env!("CARGO_PKG_VERSION"));
 
+// The library can create the pool file. Only its parent directory must already exist.
+pub(super) fn wait_for_pool_directory(
+    dir: &Path,
+    budget: Duration,
+    request_daemon: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let ready = || match dir.metadata() {
+        Ok(meta) if meta.is_dir() => Ok(true),
+        Ok(_) => bail!("{} is not a directory", dir.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("checking {}", dir.display())),
+    };
+    if ready()? {
+        return Ok(());
+    }
+
+    info!(
+        "Waiting for the Hyper-V KVP daemon to prepare {}",
+        dir.display()
+    );
+    let started = Instant::now();
+    // The guest may already have scheduled kvpd (possibly under another unit name).
+    if let Err(error) = request_daemon() {
+        warn!(
+            "Could not request hypervkvpd.service; still waiting for the pool directory: {error:#}"
+        );
+    }
+    while !ready()? {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!("timed out waiting for {}", dir.display());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+    Ok(())
+}
+
 fn response_status(error: &WireserverError) -> Option<u16> {
     match error {
         WireserverError::HttpStatus { status, .. } => Some(status.as_u16()),
@@ -53,6 +90,19 @@ pub(super) struct Reporting {
 
 impl Reporting {
     pub(super) fn for_endpoint(endpoint: String) -> Self {
+        let dir = KvpPool::default_dir();
+        let identity = read_vm_id();
+        // The root-filesystem daemon may not be available until after switch-root.
+        // Never hold up Ignition in the initramfs waiting for it.
+        if identity.is_ok() && !Path::new("/etc/initrd-release").exists() {
+            if let Err(error) = wait_for_pool_directory(
+                dir,
+                Duration::from_secs(30),
+                boot_services::request_kvp_daemon,
+            ) {
+                warn!("Could not prepare Azure KVP directory {}; continuing with best-effort KVP and HTTP reporting: {error:#}", dir.display());
+            }
+        }
         Self::new(
             WireserverConfig {
                 endpoint,
@@ -64,8 +114,8 @@ impl Reporting {
                 xml_fallback: true,
                 use_system_proxy: false,
             },
-            Path::new("/var/lib/hyperv"),
-            read_vm_id(),
+            dir,
+            identity,
             boot_services::query,
         )
     }

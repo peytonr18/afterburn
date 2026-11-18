@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Read-only snapshot of boot service failures still visible to systemd at check-in.
+//! Azure boot service integration with the system systemd manager.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
-use zbus::{blocking::connection::Builder, proxy, zvariant::OwnedObjectPath};
+use zbus::{blocking::connection::Builder, blocking::Connection, proxy, zvariant::OwnedObjectPath};
 
 // ListUnitsFiltered returns a(ssssssouso). Ignore descriptions and command output.
 type ListedUnit = (
@@ -39,6 +39,7 @@ type ListedUnit = (
 )]
 trait SystemdManager {
     fn list_units_filtered(&self, states: &[&str]) -> zbus::Result<Vec<ListedUnit>>;
+    fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
 }
 
 pub(super) struct UnitState {
@@ -48,11 +49,24 @@ pub(super) struct UnitState {
 
 pub(super) type Query = fn() -> Result<Vec<UnitState>>;
 
-pub(super) fn query() -> Result<Vec<UnitState>> {
-    let bus = Builder::system()?
+fn system_bus() -> Result<Connection> {
+    Builder::system()?
         .method_timeout(Duration::from_secs(5))
         .build()
-        .context("connecting to the system bus")?;
+        .context("connecting to the system bus")
+}
+
+pub(super) fn request_kvp_daemon() -> Result<()> {
+    let bus = system_bus()?;
+    // Queue a start, not a restart; don't replace any conflicting job.
+    SystemdManagerProxyBlocking::new(&bus)?
+        .start_unit("hypervkvpd.service", "fail")
+        .context("requesting hypervkvpd.service")?;
+    Ok(())
+}
+
+pub(super) fn query() -> Result<Vec<UnitState>> {
+    let bus = system_bus()?;
     let manager = SystemdManagerProxyBlocking::new(&bus).context("connecting to systemd")?;
     let rows = manager
         .list_units_filtered(&["failed"])

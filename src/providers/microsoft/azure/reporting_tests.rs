@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use xml::reader::{EventReader, XmlEvent};
 
 use super::boot_services::{self, UnitState};
-use super::reporting::Reporting;
+use super::reporting::{wait_for_pool_directory, Reporting};
 use super::Azure;
 use crate::providers::MetadataProvider;
 use crate::retry;
@@ -703,6 +703,74 @@ fn azure_other_http_errors_never_select_xml_or_repeat_kvp() {
         goalstate.assert();
         xml.assert();
     }
+}
+
+#[test]
+fn azure_kvp_directory_ready_never_requests_daemon_or_changes_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = store(dir.path());
+    pool.insert("existing", "untouched").unwrap();
+    let original = fs::read(pool.path()).unwrap();
+
+    wait_for_pool_directory(dir.path(), Duration::ZERO, || {
+        panic!("unnecessary start request")
+    })
+    .unwrap();
+    assert_eq!(fs::read(pool.path()).unwrap(), original);
+}
+
+#[test]
+fn azure_kvp_directory_appears_after_daemon_start() {
+    let mut server = Server::new();
+    let dir = tempfile::tempdir().unwrap();
+    let pool_dir = dir.path().join("hyperv");
+    let (health, requests) = health(&mut server, "/provisioning/health", 200);
+
+    std::thread::scope(|scope| {
+        wait_for_pool_directory(&pool_dir, Duration::from_secs(2), || {
+            // A Type=simple start can be acknowledged before kvpd creates the directory.
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                fs::create_dir(&pool_dir).unwrap();
+            });
+            Ok(())
+        })
+        .unwrap();
+        assert!(pool_dir.is_dir());
+    });
+    let pool = store(&pool_dir);
+    assert!(!pool.path().exists()); // The reporter, not the readiness check, writes the guest file.
+    reporting(&server, &pool_dir).check_in().unwrap();
+    assert_eq!(report(&pool).result(), ReportResult::Success);
+    assert_delivery_trace(&pool, true);
+    assert_eq!(json_body(&requests)["state"], "Ready");
+    health.assert();
+}
+
+#[test]
+fn azure_kvp_directory_unavailable_is_bounded_and_never_created_by_afterburn() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("hyperv");
+    let budget = Duration::from_millis(20);
+    let started = Instant::now();
+    let err = wait_for_pool_directory(&missing, budget, || anyhow::bail!("daemon is masked"))
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out waiting"));
+    assert!((budget..Duration::from_secs(2)).contains(&started.elapsed()));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn azure_kvp_directory_can_appear_even_if_start_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("hyperv");
+    wait_for_pool_directory(&missing, Duration::from_secs(1), || {
+        // Simulate an independently scheduled daemon creating the directory.
+        fs::create_dir(&missing)?;
+        anyhow::bail!("not authorized to start services")
+    })
+    .unwrap();
+    assert!(!store(&missing).path().exists());
 }
 
 #[test]
